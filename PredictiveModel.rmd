@@ -1,0 +1,1018 @@
+---
+title: "NFL 2025 Predictions"
+author: "NFL by milo"
+date: "2025-09-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+
+# Libraries
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+rm(list = ls())
+
+library("xgboost")
+
+library("stringr")
+
+library("purrr")
+
+library("ggplot2")
+
+library("knitr")
+
+library("dplyr")
+
+library("tidyverse")
+
+library("gt")
+
+library("magrittr")
+
+library("png")
+
+library("nflfastR") ## Play by play
+#ls("package:nflfastR")
+
+library("fastrmodels") ##Models for the 'nflfastR' Package
+#ls("package:fastrmodels")
+
+library("colorr") ##Paletas de color de cada equipo de NFL
+ls("package:colorr")
+
+library("nfl4th") ##Functions to Calculate Optimal Fourth Down Decisions in the National Football League
+#ls("package:nfl4th")
+
+library("nflplotR") ##NFL Logo Plots in 'ggplot2'
+#ls("package:nflplotR")
+
+library("nflreadr") ##Download 'nflverse' Data
+#ls("package:nflreadr")
+
+library("nflseedR") ##Functions to Efficiently Simulate and Evaluate NFL Seasons
+#ls("package:nflseedR")
+
+library("NFLSimulatoR") ##Simulating Plays and Drives in the NFL
+#ls("package:NFLSimulatoR")
+
+library("nflverse") ##Easily Install and Load the 'nflverse'
+#ls("package:nflverse")
+
+options(nflreadr.verbose = FALSE)
+options(scipen = 9999)
+```
+
+# Preparación de BDD
+
+```{r}
+pbp <- nflfastR::load_pbp(2025) %>%
+  dplyr::filter(season_type == "REG") %>%
+  # Fix Robinson naming conflicts
+  dplyr::mutate(
+    receiver_player_name = ifelse(receiver_id == "00-0038542", "Bijan Robinson", receiver_player_name),
+    rusher_player_name   = ifelse(rusher_id   == "00-0038542", "Bijan Robinson", rusher_player_name),
+    receiver_player_name = ifelse(receiver_id == "00-0037746", "Brian Robinson", receiver_player_name),
+    rusher_player_name   = ifelse(rusher_id   == "00-0037746", "Brian Robinson", rusher_player_name),
+    # Normalize run_gap column
+    run_gap = ifelse(run_location == "middle", "center", run_gap)
+  )
+
+sched <- nflreadr::load_schedules(2025) %>%
+  dplyr::filter(game_type == "REG") %>%
+  mutate(
+    home_win = case_when(
+      home_score > away_score ~ 1L,
+      home_score < away_score ~ 0L,
+      TRUE ~ NA_integer_   # ties -> NA
+    ),
+    winner = case_when(
+      home_score > away_score ~ home_team,
+      home_score < away_score ~ away_team,
+      TRUE ~ "TIE"
+    )
+  ) %>%
+  select(game_id, week, home_team, away_team, home_score, away_score, home_win, winner)
+
+```
+
+## Left Join para Winners
+
+```{r}
+pbp <- pbp %>%
+  left_join(sched, by = "game_id")
+```
+
+
+
+
+```{r}
+pbp_off <- pbp %>% filter(!is.na(posteam))
+
+# If there are duplicate week columns from the join, collapse them
+if (all(c("week.x","week.y") %in% names(pbp_off))) {
+  pbp_off <- pbp_off %>%
+    mutate(week = coalesce(week.x, week.y)) %>%
+    select(-week.x, -week.y)
+}
+
+
+team_game_feats <- pbp_off %>%
+  dplyr::group_by(game_id, week, posteam) %>%
+  dplyr::summarise(
+    plays               = dplyr::n(),
+    epa_per_play        = mean(epa, na.rm = TRUE),
+    success_rate        = mean(success, na.rm = TRUE),
+    yards_per_play      = mean(yards_gained, na.rm = TRUE),
+    pass_rate           = mean(pass_attempt == 1, na.rm = TRUE),
+    rush_rate           = mean(rush_attempt == 1, na.rm = TRUE),
+    sack_rate           = mean(sack == 1, na.rm = TRUE),
+    int_rate            = mean(interception == 1, na.rm = TRUE),
+    fumble_lost_rate    = mean(fumble_lost == 1, na.rm = TRUE),
+    explosive_rate_20y  = mean(yards_gained >= 20, na.rm = TRUE),
+    penalty_rate        = mean(penalty == 1, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # drop week from sched to avoid week.x / week.y
+  dplyr::left_join(
+    sched %>% dplyr::select(game_id, home_team, away_team),
+    by = "game_id"
+  ) %>%
+  dplyr::mutate(
+    team = posteam,
+    opponent = dplyr::if_else(team == home_team, away_team, home_team)
+  )
+
+```
+
+```{r}
+# 1) Home/away feature frames
+home_feats <- team_game_feats %>%
+  filter(team == home_team) %>%
+  select(game_id, week, starts_with(c("plays","epa_","success_","yards_",
+                                      "pass_","rush_","sack_","int_",
+                                      "fumble_","explosive_","penalty_"))) %>%
+  rename_with(~ paste0("home_", .x), -c(game_id, week))
+
+away_feats <- team_game_feats %>%
+  filter(team == away_team) %>%
+  select(game_id, week, starts_with(c("plays","epa_","success_","yards_",
+                                      "pass_","rush_","sack_","int_",
+                                      "fumble_","explosive_","penalty_"))) %>%
+  rename_with(~ paste0("away_", .x), -c(game_id, week))
+
+# 2) Join outcome labels from sched
+games_df <- sched %>%
+  select(game_id, week, home_team, away_team, home_score, away_score, home_win, winner) %>%
+  left_join(home_feats, by = c("game_id","week")) %>%
+  left_join(away_feats, by = c("game_id","week")) %>%
+  filter(!is.na(home_win))   # drop ties/unfinished
+
+# 3) Build difference features (home − away)
+library(dplyr)
+library(stringr)
+
+# 3) Build difference features (home − away), robust version
+
+# 3a) candidate home_* columns
+home_candidates <- names(games_df)[str_starts(names(games_df), "home_")]
+
+# 3b) only keep columns that have a matching away_* sibling
+paired_home <- home_candidates[
+  str_replace(home_candidates, "^home_", "away_") %in% names(games_df)
+]
+paired_away <- str_replace(paired_home, "^home_", "away_")
+
+# 3c) keep only numeric pairs (drops home_team, etc.)
+is_num_pair <- vapply(
+  seq_along(paired_home),
+  function(i) is.numeric(games_df[[ paired_home[i] ]]) && is.numeric(games_df[[ paired_away[i] ]]),
+  logical(1)
+)
+paired_home <- paired_home[is_num_pair]
+paired_away <- paired_away[is_num_pair]
+
+# 3d) subtract (elementwise) and rename to diff_*
+home_mat <- games_df %>% select(all_of(paired_home)) %>% as.matrix()
+away_mat <- games_df %>% select(all_of(paired_away)) %>% as.matrix()
+diff_mat <- home_mat - away_mat
+colnames(diff_mat) <- str_replace(colnames(diff_mat), "^home_", "diff_")
+
+# 3e) final diff_df
+diff_df <- bind_cols(
+  games_df %>% select(game_id, week, home_win),
+  as.data.frame(diff_mat)
+)
+
+```
+
+
+#Modelo
+
+```{r}
+
+# ----------------------------------------------------
+# Helper: Exponentially weighted priors
+# ----------------------------------------------------
+make_team_priors <- function(team_game_feats, up_to_week, lambda = 0.7) {
+  # lambda = decay factor (closer to 1 = weight recent games more)
+  feats <- team_game_feats %>%
+    filter(week < up_to_week) %>%
+    select(team, week, plays, epa_per_play, success_rate, yards_per_play,
+           pass_rate, rush_rate, sack_rate, int_rate, fumble_lost_rate,
+           explosive_rate_20y, penalty_rate)
+  
+  if (nrow(feats) == 0) return(NULL)
+  
+  feats <- feats %>%
+    group_by(team) %>%
+    arrange(week, .by_group = TRUE) %>%
+    mutate(weight = lambda^(max(week) - week)) %>%  # newer weeks higher weight
+    summarise(across(where(is.numeric), ~ weighted.mean(.x, w = weight, na.rm = TRUE)), .groups = "drop")
+  
+  feats
+}
+
+# ----------------------------------------------------
+# Function to train & predict one week
+# ----------------------------------------------------
+predict_week <- function(train_weeks, predict_week, team_game_feats, sched) {
+  # 1. Build training data (team vs opponent rows with outcome)
+  opp_feats <- team_game_feats %>%
+    select(game_id, team = team, all_of(feature_cols)) %>%
+    rename_with(~ paste0("o_", .x), all_of(feature_cols)) %>%
+    rename(opponent = team)
+  
+  team_vs_opp <- team_game_feats %>%
+    select(game_id, week, team, opponent, all_of(feature_cols)) %>%
+    rename_with(~ paste0("t_", .x), all_of(feature_cols)) %>%
+    left_join(opp_feats, by = c("game_id", "opponent")) %>%
+    left_join(sched %>% select(game_id, winner, home_team, away_team), by = "game_id") %>%
+    mutate(
+      team_win = if_else(team == winner, 1L, 0L, missing = NA_integer_),
+      home_indicator = if_else(team == home_team, 1L, 0L) # home field feature
+    )
+  
+  train <- team_vs_opp %>%
+    filter(week %in% train_weeks, !is.na(team_win))
+  
+  # predictors
+  t_cols <- paste0("t_", feature_cols)
+  o_cols <- paste0("o_", feature_cols)
+  num_preds <- c(t_cols, o_cols, "home_indicator")
+  
+  train_mat <- as.matrix(train[, num_preds])
+  train_label <- train$team_win
+  
+  # 2. Fit XGBoost model
+  dtrain <- xgb.DMatrix(data = train_mat, label = train_label)
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 3,
+    eta = 0.1,
+    subsample = 0.8,
+    colsample_bytree = 0.8,
+    min_child_weight = 5
+  )
+  
+  xgb_fit <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 300,
+    verbose = 0
+  )
+  
+  # 3. Build priors for prediction week
+  priors <- make_team_priors(team_game_feats, up_to_week = predict_week, lambda = 0.7)
+  
+  wk_matchups <- sched %>%
+    filter(week == predict_week) %>%
+    select(game_id, week, home_team, away_team)
+  
+  wk_long <- bind_rows(
+    wk_matchups %>% transmute(game_id, week, team = home_team, opponent = away_team, side = "home"),
+    wk_matchups %>% transmute(game_id, week, team = away_team, opponent = home_team, side = "away")
+  )
+  
+  wk_feats <- wk_long %>%
+    left_join(priors, by = c("team" = "team")) %>%
+    rename_with(~ paste0("t_", .x), all_of(feature_cols)) %>%
+    left_join(priors, by = c("opponent" = "team")) %>%
+    rename_with(~ paste0("o_", .x), all_of(feature_cols)) %>%
+    mutate(
+      home_indicator = if_else(side == "home", 1L, 0L),
+      across(all_of(c(paste0("t_", feature_cols), paste0("o_", feature_cols))),
+             ~ replace_na(., 0))
+    )
+  
+  test_mat <- as.matrix(wk_feats[, num_preds])
+  dtest <- xgb.DMatrix(data = test_mat)
+  
+  wk_feats$prob_team_win <- predict(xgb_fit, newdata = dtest)
+  
+  # 4. Normalize per game (so home+away ≈ 1)
+  wk_pred <- wk_feats %>%
+    select(game_id, team, opponent, side, prob_team_win) %>%
+    group_by(game_id) %>%
+    summarise(
+      week = first(team_vs_opp$week[team_vs_opp$game_id == game_id]),
+      home_team = team[side == "home"][1],
+      away_team = team[side == "away"][1],
+      prob_home_raw = prob_team_win[side == "home"][1],
+      prob_away_raw = prob_team_win[side == "away"][1],
+      .groups = "drop"
+    ) %>%
+    mutate(
+      denom = prob_home_raw + prob_away_raw,
+      prob_home_win = ifelse(denom > 0, prob_home_raw / denom, 0.5),
+      prob_away_win = 1 - prob_home_win,
+      predicted_winner = ifelse(prob_home_win >= 0.5, home_team, away_team)
+    ) %>%
+    select(week, home_team, away_team, prob_home_win, prob_away_win, predicted_winner)
+  
+  wk_pred
+}
+
+# ----------------------------------------------------
+# Example: predict Week 3
+# ----------------------------------------------------
+feature_cols <- c("plays","epa_per_play","success_rate","yards_per_play",
+                  "pass_rate","rush_rate","sack_rate","int_rate",
+                  "fumble_lost_rate","explosive_rate_20y","penalty_rate")
+
+preds_week3 <- predict_week(train_weeks = 1:2, predict_week = 3,
+                            team_game_feats = team_game_feats, sched = sched)
+
+preds_week3
+```
+
+#Modelo 2
+```{r}
+set.seed(42)
+
+feature_cols <- c(
+  "plays","epa_per_play","success_rate","yards_per_play",
+  "pass_rate","rush_rate","sack_rate","int_rate",
+  "fumble_lost_rate","explosive_rate_20y","penalty_rate"
+)
+
+lambda <- 0.70  # decay for priors
+
+```
+
+```{r}
+make_team_priors <- function(team_game_feats, up_to_week, lambda = 0.7) {
+  feats <- team_game_feats %>%
+    filter(week < up_to_week) %>%
+    select(team, week, all_of(feature_cols))
+  
+  if (nrow(feats) == 0) return(NULL)
+  
+  feats %>%
+    group_by(team) %>%
+    arrange(week, .by_group = TRUE) %>%
+    mutate(weight = lambda^(max(week) - week)) %>%
+    summarise(across(all_of(feature_cols), ~ weighted.mean(.x, w = weight, na.rm = TRUE)), .groups = "drop")
+}
+
+```
+
+```{r}
+build_training_data <- function(train_weeks, team_game_feats, sched, lambda = 0.7) {
+  out <- list()
+  for (w in sort(unique(train_weeks))) {
+    priors <- make_team_priors(team_game_feats, up_to_week = w, lambda = lambda)
+    # si aún no hay historia, salta
+    if (is.null(priors) || nrow(priors) == 0) next
+    
+    wk_games <- sched %>%
+      filter(week == w) %>%
+      select(game_id, week, home_team, away_team, home_win)
+    
+    if (nrow(wk_games) == 0) next
+    
+    # Join priors para home y away
+    wk_df <- wk_games %>%
+      left_join(priors %>% rename_with(~ paste0("home_", .x), all_of(feature_cols)),
+                by = c("home_team" = "team")) %>%
+      left_join(priors %>% rename_with(~ paste0("away_", .x), all_of(feature_cols)),
+                by = c("away_team" = "team"))
+    
+    # Diferencias (home − away)
+    diff_mat <- wk_df %>%
+      mutate(across(all_of(paste0("home_", feature_cols)), ~ replace_na(., 0))) %>%
+      mutate(across(all_of(paste0("away_", feature_cols)), ~ replace_na(., 0)))
+    
+    for (fc in feature_cols) {
+      diff_mat[[paste0("diff_", fc)]] <- diff_mat[[paste0("home_", fc)]] - diff_mat[[paste0("away_", fc)]]
+    }
+    
+    # Etiqueta y columnas finales
+    final_w <- diff_mat %>%
+      transmute(
+        game_id, week, home_team, away_team, home_win,
+        across(starts_with("diff_"))
+      )
+    
+    out[[length(out) + 1]] <- final_w
+  }
+  bind_rows(out)
+}
+
+```
+
+```{r}
+fit_xgb_diff <- function(train_df) {
+  # separar últimas semanas de train como validación (time split)
+  last_train_week <- max(train_df$week, na.rm = TRUE)
+  val_weeks <- last_train_week
+  tr_weeks  <- setdiff(unique(train_df$week), val_weeks)
+  
+  x_cols <- grep("^diff_", names(train_df), value = TRUE)
+  
+  dtrain <- xgb.DMatrix(
+    data  = as.matrix(train_df %>% filter(week %in% tr_weeks) %>% select(all_of(x_cols))),
+    label = train_df %>% filter(week %in% tr_weeks) %>% pull(home_win)
+  )
+  dvalid <- xgb.DMatrix(
+    data  = as.matrix(train_df %>% filter(week %in% val_weeks) %>% select(all_of(x_cols))),
+    label = train_df %>% filter(week %in% val_weeks) %>% pull(home_win)
+  )
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.08,
+    subsample = 0.85,
+    colsample_bytree = 0.9,
+    min_child_weight = 3
+  )
+  
+  watchlist <- list(train = dtrain, eval = dvalid)
+  
+  fit <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1500,
+    watchlist = watchlist,
+    early_stopping_rounds = 50,
+    verbose = 0
+  )
+  
+  list(
+    model = fit,
+    x_cols = x_cols,
+    val_week = val_weeks
+  )
+}
+
+```
+
+```{r}
+calibrate_platt <- function(fit_obj, train_df) {
+  x_cols <- fit_obj$x_cols
+  val_w  <- fit_obj$val_week
+  m      <- fit_obj$model
+  
+  dvalid <- xgb.DMatrix(as.matrix(train_df %>% filter(week %in% val_w) %>% select(all_of(x_cols))))
+  raw_p  <- predict(m, dvalid)
+  y_val  <- train_df %>% filter(week %in% val_w) %>% pull(home_win)
+  
+  # Platt: logistic sobre logits
+  logits <- qlogis(pmin(pmax(raw_p, 1e-6), 1 - 1e-6))
+  platt  <- suppressWarnings(glm(y_val ~ logits, family = binomial()))
+  
+  list(platt = platt)
+}
+
+apply_platt <- function(raw_probs, platt_fit) {
+  logits <- qlogis(pmin(pmax(raw_probs, 1e-6), 1 - 1e-6))
+  as.numeric(plogis(coef(platt_fit)[1] + coef(platt_fit)[2] * logits))
+}
+
+```
+
+```{r}
+predict_week_diff <- function(predict_week, team_game_feats, sched, fit_obj, platt_obj = NULL, lambda = 0.7) {
+  priors <- make_team_priors(team_game_feats, up_to_week = predict_week, lambda = lambda)
+  wk_games <- sched %>% filter(week == predict_week) %>% select(game_id, week, home_team, away_team)
+  if (nrow(wk_games) == 0) return(tibble())
+  
+  wk_df <- wk_games %>%
+    left_join(priors %>% rename_with(~ paste0("home_", .x), all_of(feature_cols)),
+              by = c("home_team" = "team")) %>%
+    left_join(priors %>% rename_with(~ paste0("away_", .x), all_of(feature_cols)),
+              by = c("away_team" = "team")) %>%
+    # 👇 FIX: fill missing priors with league averages (or 0 if you prefer)
+    mutate(across(starts_with("home_"), ~ replace_na(., mean(., na.rm = TRUE)))) %>%
+    mutate(across(starts_with("away_"), ~ replace_na(., mean(., na.rm = TRUE))))
+  
+  # Now safe to compute differences
+  for (fc in feature_cols) {
+    wk_df[[paste0("diff_", fc)]] <- wk_df[[paste0("home_", fc)]] - wk_df[[paste0("away_", fc)]]
+  }
+  
+  x_mat <- as.matrix(wk_df %>% select(all_of(fit_obj$x_cols)))
+  dtest <- xgb.DMatrix(x_mat)
+  
+  raw_p <- predict(fit_obj$model, dtest, ntreelimit = fit_obj$model$best_iteration)
+  prob  <- if (!is.null(platt_obj)) apply_platt(raw_p, platt_obj$platt) else raw_p
+  
+  wk_df %>%
+    transmute(
+      week,
+      home_team, away_team,
+      prob_home_win = prob,
+      prob_away_win = 1 - prob,
+      predicted_winner = if_else(prob_home_win >= 0.5, home_team, away_team)
+    )
+}
+
+```
+
+```{r}
+# 1) Dataset de entrenamiento con semanas 1-2 (para predecir Week 3)
+train_df <- build_training_data(train_weeks = 1:2, team_game_feats = team_game_feats, sched = sched, lambda = lambda)
+
+# 2) Fit + early stopping
+fit_obj  <- fit_xgb_diff(train_df)
+
+# 3) (Opcional) calibración
+platt_obj <- calibrate_platt(fit_obj, train_df)
+
+# 4) Predicción Week 3
+preds_week3 <- predict_week_diff(
+  predict_week = 3,
+  team_game_feats = team_game_feats,
+  sched = sched,
+  fit_obj = fit_obj,
+  platt_obj = platt_obj,
+  lambda = lambda
+)
+
+preds_week3 %>% arrange(desc(prob_home_win)) %>% gt()
+
+```
+
+```{r}
+# ---------------------------------------------
+# 1) Priors without leaking week into averages
+# ---------------------------------------------
+make_team_priors <- function(team_game_feats, up_to_week, lambda = 0.7) {
+  feats <- team_game_feats %>%
+    dplyr::filter(week < up_to_week) %>%
+    dplyr::select(team, week, dplyr::all_of(feature_cols))
+  
+  if (nrow(feats) == 0) return(NULL)
+  
+  feats %>%
+    dplyr::group_by(team) %>%
+    dplyr::arrange(week, .by_group = TRUE) %>%
+    dplyr::mutate(weight = lambda^(max(week) - week)) %>%
+    # IMPORTANT: only average feature_cols (do NOT include week)
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(feature_cols), ~ stats::weighted.mean(.x, w = weight, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}
+
+# -------------------------------------------------------
+# 2) XGBoost fit with safe time-split (handles tiny data)
+# -------------------------------------------------------
+fit_xgb_diff <- function(train_df) {
+  stopifnot(any(grepl("^diff_", names(train_df))))
+  x_cols <- grep("^diff_", names(train_df), value = TRUE)
+  
+  # if there's only 1 distinct week, train without a validation set
+  if (length(unique(train_df$week)) < 2) {
+    dtrain <- xgb.DMatrix(
+      data  = as.matrix(train_df %>% dplyr::select(dplyr::all_of(x_cols))),
+      label = train_df$home_win
+    )
+    params <- list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = 4,
+      eta = 0.08,
+      subsample = 0.85,
+      colsample_bytree = 0.9,
+      min_child_weight = 3
+    )
+    fit <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 400,
+      verbose = 0
+    )
+    return(list(model = fit, x_cols = x_cols, val_week = NA_integer_))
+  }
+  
+  last_train_week <- max(train_df$week, na.rm = TRUE)
+  val_weeks <- last_train_week
+  tr_weeks  <- setdiff(unique(train_df$week), val_weeks)
+  
+  # if train split ends up empty, fall back to no-val training
+  if (length(tr_weeks) == 0) {
+    dtrain <- xgb.DMatrix(
+      data  = as.matrix(train_df %>% dplyr::select(dplyr::all_of(x_cols))),
+      label = train_df$home_win
+    )
+    params <- list(
+      objective = "binary:logistic",
+      eval_metric = "logloss",
+      max_depth = 4,
+      eta = 0.08,
+      subsample = 0.85,
+      colsample_bytree = 0.9,
+      min_child_weight = 3
+    )
+    fit <- xgb.train(
+      params = params,
+      data = dtrain,
+      nrounds = 400,
+      verbose = 0
+    )
+    return(list(model = fit, x_cols = x_cols, val_week = NA_integer_))
+  }
+  
+  dtrain <- xgb.DMatrix(
+    data  = as.matrix(train_df %>% dplyr::filter(week %in% tr_weeks) %>% dplyr::select(dplyr::all_of(x_cols))),
+    label = train_df %>% dplyr::filter(week %in% tr_weeks) %>% dplyr::pull(home_win)
+  )
+  dvalid <- xgb.DMatrix(
+    data  = as.matrix(train_df %>% dplyr::filter(week %in% val_weeks) %>% dplyr::select(dplyr::all_of(x_cols))),
+    label = train_df %>% dplyr::filter(week %in% val_weeks) %>% dplyr::pull(home_win)
+  )
+  
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.08,
+    subsample = 0.85,
+    colsample_bytree = 0.9,
+    min_child_weight = 3
+  )
+  
+  watchlist <- list(train = dtrain, eval = dvalid)
+  fit <- xgb.train(
+    params = params,
+    data = dtrain,
+    nrounds = 1500,
+    watchlist = watchlist,
+    early_stopping_rounds = 50,
+    verbose = 0
+  )
+  
+  list(model = fit, x_cols = x_cols, val_week = val_weeks)
+}
+
+# ------------------------------------------------------------------
+# 3) Predict one week with robust NA-fills via league averages (ex-ante)
+# ------------------------------------------------------------------
+predict_week_diff <- function(predict_week, team_game_feats, sched, fit_obj, platt_obj = NULL, lambda = 0.7) {
+  library(dplyr); library(stringr)
+  
+  # compute priors and a league-average fallback using weeks < predict_week
+  priors <- make_team_priors(team_game_feats, up_to_week = predict_week, lambda = lambda)
+  
+  # league averages (if priors are NULL or all-NA, fallback to zeros)
+  if (is.null(priors) || nrow(priors) == 0) {
+    league_avg <- setNames(as.list(rep(0, length(feature_cols))), feature_cols)
+  } else {
+    league_avg <- priors %>%
+      summarise(across(all_of(feature_cols), ~ mean(.x, na.rm = TRUE))) %>%
+      as.list()
+  }
+  
+  wk_games <- sched %>%
+    filter(week == predict_week) %>%
+    select(game_id, week, home_team, away_team)
+  if (nrow(wk_games) == 0) return(tibble())
+  
+  wk_df <- wk_games %>%
+    left_join(priors %>% rename_with(~ paste0("home_", .x), all_of(feature_cols)),
+              by = c("home_team" = "team")) %>%
+    left_join(priors %>% rename_with(~ paste0("away_", .x), all_of(feature_cols)),
+              by = c("away_team" = "team"))
+  
+  # If priors were NULL, those joins created only NAs. Fill with league averages.
+  # Even when priors exist, fill team-specific NAs (e.g., teams with no games yet).
+  if (length(feature_cols) > 0) {
+    fill_with_league <- function(col_name, vec) {
+      base <- sub("^(home_|away_)", "", col_name)
+      dplyr::coalesce(vec, as.numeric(league_avg[[base]]))
+    }
+    for (fc in feature_cols) {
+      hcol <- paste0("home_", fc)
+      acol <- paste0("away_", fc)
+      if (!hcol %in% names(wk_df)) wk_df[[hcol]] <- NA_real_
+      if (!acol %in% names(wk_df)) wk_df[[acol]] <- NA_real_
+      wk_df[[hcol]] <- fill_with_league(hcol, wk_df[[hcol]])
+      wk_df[[acol]] <- fill_with_league(acol, wk_df[[acol]])
+    }
+  }
+  
+  # build differences (home − away)
+  for (fc in feature_cols) {
+    wk_df[[paste0("diff_", fc)]] <- wk_df[[paste0("home_", fc)]] - wk_df[[paste0("away_", fc)]]
+  }
+  
+  # ensure columns order
+  x_cols <- fit_obj$x_cols
+  missing_x <- setdiff(x_cols, names(wk_df))
+  if (length(missing_x) > 0) {
+    # create any missing diff_* as zeros
+    for (mx in missing_x) wk_df[[mx]] <- 0
+  }
+  
+  x_mat <- as.matrix(wk_df %>% dplyr::select(dplyr::all_of(x_cols)))
+  dtest <- xgb.DMatrix(x_mat)
+  
+  # best_iteration exists only if early stopping ran; guard it
+  ntreelimit <- if (!is.null(fit_obj$model$best_iteration)) fit_obj$model$best_iteration else NULL
+  
+  raw_p <- predict(fit_obj$model, dtest, ntreelimit = ntreelimit)
+  prob  <- if (!is.null(platt_obj)) apply_platt(raw_p, platt_obj$platt) else raw_p
+  
+  wk_df %>%
+    transmute(
+      week,
+      home_team, away_team,
+      prob_home_win = prob,
+      prob_away_win = 1 - prob,
+      predicted_winner = if_else(prob_home_win >= 0.5, home_team, away_team)
+    )
+}
+
+```
+
+```{r}
+train_df <- build_training_data(train_weeks = 1:2, team_game_feats = team_game_feats, sched = sched, lambda = 0.7)
+fit_obj  <- fit_xgb_diff(train_df)
+preds_week3 <- predict_week_diff(3, team_game_feats, sched, fit_obj, platt_obj, lambda = 0.7)
+preds_week3
+
+```
+
+```{r}
+# ==== PRETRAIN (2023–2024) + FINE-TUNE (2025 Wk 1–2) ====
+
+# helper to build team_game_feats & sched for a season (same logic you used for 2025)
+get_feats <- function(yr) {
+  pbp_y <- nflfastR::load_pbp(yr) %>% dplyr::filter(season_type == "REG")
+  sched_y <- nflreadr::load_schedules(yr) %>%
+    dplyr::filter(game_type == "REG") %>%
+    dplyr::mutate(home_win = dplyr::case_when(home_score > away_score ~ 1L,
+                                              home_score < away_score ~ 0L, TRUE ~ NA_integer_)) %>%
+    dplyr::select(game_id, week, home_team, away_team, home_score, away_score, home_win)
+  tgf_y <- pbp_y %>%
+    dplyr::filter(!is.na(posteam)) %>%
+    dplyr::group_by(game_id, week, posteam) %>%
+    dplyr::summarise(
+      plays = dplyr::n(),
+      epa_per_play = mean(epa, na.rm = TRUE),
+      success_rate = mean(success, na.rm = TRUE),
+      yards_per_play = mean(yards_gained, na.rm = TRUE),
+      pass_rate = mean(pass_attempt == 1, na.rm = TRUE),
+      rush_rate = mean(rush_attempt == 1, na.rm = TRUE),
+      sack_rate = mean(sack == 1, na.rm = TRUE),
+      int_rate = mean(interception == 1, na.rm = TRUE),
+      fumble_lost_rate = mean(fumble_lost == 1, na.rm = TRUE),
+      explosive_rate_20y = mean(yards_gained >= 20, na.rm = TRUE),
+      penalty_rate = mean(penalty == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(sched_y %>% dplyr::select(game_id, home_team, away_team), by = "game_id") %>%
+    dplyr::mutate(team = posteam,
+                  opponent = dplyr::if_else(team == home_team, away_team, home_team)) %>%
+    dplyr::select(game_id, week, team, opponent, dplyr::all_of(feature_cols))
+  list(team_game_feats = tgf_y, sched = sched_y)
+}
+
+# 1) build historical training rows (each season separately) and combine
+f23 <- get_feats(2023); train_23 <- build_training_data(1:18, f23$team_game_feats, f23$sched, lambda = 0.7)
+f24 <- get_feats(2024); train_24 <- build_training_data(1:18, f24$team_game_feats, f24$sched, lambda = 0.7)
+train_hist <- dplyr::bind_rows(train_23, train_24)
+
+# 2) fine-tune data: 2025 weeks 1–2 from your already-built 2025 objects
+train_25 <- build_training_data(1:2, team_game_feats, sched, lambda = 0.7)
+
+# 3) final training frame = historical + early 2025
+train_all <- dplyr::bind_rows(train_hist, train_25)
+
+# 4) fit model (time-aware split inside), optional calibration
+fit_obj   <- fit_xgb_diff(train_all)
+platt_obj <- calibrate_platt(fit_obj, train_all)  # optional
+
+# 5) predict Week 3 (now with a warm-started model)
+preds_week3 <- predict_week_diff(3, team_game_feats, sched, fit_obj, platt_obj, lambda = 0.7)
+preds_week3
+```
+
+```{r}
+# =========================================================
+# CONFIG
+# =========================================================
+set.seed(42)
+w_2025 <- 3.0  # <-- Aumenta/reduce para dar más/menos peso a 2025
+lambda  <- 0.70
+feature_cols <- c(
+  "plays","epa_per_play","success_rate","yards_per_play",
+  "pass_rate","rush_rate","sack_rate","int_rate",
+  "fumble_lost_rate","explosive_rate_20y","penalty_rate"
+)
+
+# =========================================================
+# HELPERS (compactos y robustos)
+# =========================================================
+get_feats <- function(yr) {
+  pbp_y <- nflfastR::load_pbp(yr) %>% dplyr::filter(season_type == "REG")
+  sched_y <- nflreadr::load_schedules(yr) %>%
+    dplyr::filter(game_type == "REG") %>%
+    dplyr::mutate(
+      home_win = dplyr::case_when(
+        home_score > away_score ~ 1L,
+        home_score < away_score ~ 0L,
+        TRUE ~ NA_integer_
+      )
+    ) %>%
+    dplyr::select(game_id, week, home_team, away_team, home_score, away_score, home_win)
+  
+  tgf_y <- pbp_y %>%
+    dplyr::filter(!is.na(posteam)) %>%
+    dplyr::group_by(game_id, week, posteam) %>%
+    dplyr::summarise(
+      plays = dplyr::n(),
+      epa_per_play = mean(epa, na.rm = TRUE),
+      success_rate = mean(success, na.rm = TRUE),
+      yards_per_play = mean(yards_gained, na.rm = TRUE),
+      pass_rate = mean(pass_attempt == 1, na.rm = TRUE),
+      rush_rate = mean(rush_attempt == 1, na.rm = TRUE),
+      sack_rate = mean(sack == 1, na.rm = TRUE),
+      int_rate = mean(interception == 1, na.rm = TRUE),
+      fumble_lost_rate = mean(fumble_lost == 1, na.rm = TRUE),
+      explosive_rate_20y = mean(yards_gained >= 20, na.rm = TRUE),
+      penalty_rate = mean(penalty == 1, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    dplyr::left_join(sched_y %>% dplyr::select(game_id, home_team, away_team), by = "game_id") %>%
+    dplyr::mutate(
+      team = posteam,
+      opponent = dplyr::if_else(team == home_team, away_team, home_team)
+    ) %>%
+    dplyr::select(game_id, week, team, opponent, dplyr::all_of(feature_cols))
+  
+  list(team_game_feats = tgf_y, sched = sched_y)
+}
+
+make_team_priors <- function(team_game_feats, up_to_week, lambda = 0.7) {
+  feats <- team_game_feats %>%
+    dplyr::filter(week < up_to_week) %>%
+    dplyr::select(team, week, dplyr::all_of(feature_cols))
+  if (nrow(feats) == 0) return(NULL)
+  feats %>%
+    dplyr::group_by(team) %>%
+    dplyr::arrange(week, .by_group = TRUE) %>%
+    dplyr::mutate(weight = lambda^(max(week) - week)) %>%
+    dplyr::summarise(
+      dplyr::across(dplyr::all_of(feature_cols), ~ stats::weighted.mean(.x, w = weight, na.rm = TRUE)),
+      .groups = "drop"
+    )
+}
+
+build_training_data <- function(train_weeks, team_game_feats, sched, lambda = 0.7) {
+  out <- list()
+  for (w in sort(unique(train_weeks))) {
+    priors <- make_team_priors(team_game_feats, up_to_week = w, lambda = lambda)
+    if (is.null(priors) || nrow(priors) == 0) next
+    wk_games <- sched %>% dplyr::filter(week == w) %>%
+      dplyr::select(game_id, week, home_team, away_team, home_win)
+    if (nrow(wk_games) == 0) next
+    
+    wk_df <- wk_games %>%
+      dplyr::left_join(priors %>% dplyr::rename_with(~ paste0("home_", .x), dplyr::all_of(feature_cols)),
+                       by = c("home_team" = "team")) %>%
+      dplyr::left_join(priors %>% dplyr::rename_with(~ paste0("away_", .x), dplyr::all_of(feature_cols)),
+                       by = c("away_team" = "team"))
+    
+    # Liga promedio para rellenar NAs
+    league_avg <- priors %>% dplyr::summarise(dplyr::across(dplyr::all_of(feature_cols), ~ mean(.x, na.rm = TRUE))) %>% as.list()
+    for (fc in feature_cols) {
+      h <- paste0("home_", fc); a <- paste0("away_", fc)
+      if (!h %in% names(wk_df)) wk_df[[h]] <- NA_real_
+      if (!a %in% names(wk_df)) wk_df[[a]] <- NA_real_
+      wk_df[[h]] <- dplyr::coalesce(wk_df[[h]], as.numeric(league_avg[[fc]]))
+      wk_df[[a]] <- dplyr::coalesce(wk_df[[a]], as.numeric(league_avg[[fc]]))
+      wk_df[[paste0("diff_", fc)]] <- wk_df[[h]] - wk_df[[a]]
+    }
+    
+    out[[length(out) + 1]] <- wk_df %>%
+      dplyr::transmute(game_id, week, home_team, away_team, home_win,
+                       dplyr::across(tidyselect::starts_with("diff_")))
+  }
+  dplyr::bind_rows(out)
+}
+
+# Entrenador con pesos por fila (sin validación temporal para evitar conflicto multi-temporada)
+fit_xgb_weighted <- function(train_df, row_weights = NULL) {
+  x_cols <- grep("^diff_", names(train_df), value = TRUE)
+  dtrain <- xgb.DMatrix(
+    data   = as.matrix(train_df %>% dplyr::select(dplyr::all_of(x_cols))),
+    label  = train_df$home_win,
+    weight = row_weights
+  )
+  params <- list(
+    objective = "binary:logistic",
+    eval_metric = "logloss",
+    max_depth = 4,
+    eta = 0.08,
+    subsample = 0.9,
+    colsample_bytree = 0.9,
+    min_child_weight = 3
+  )
+  fit <- xgb.train(params = params, data = dtrain, nrounds = 600, verbose = 0)
+  list(model = fit, x_cols = x_cols)
+}
+
+predict_week_diff <- function(predict_week, team_game_feats, sched, fit_obj, lambda = 0.7) {
+  priors <- make_team_priors(team_game_feats, up_to_week = predict_week, lambda = lambda)
+  wk_games <- sched %>% dplyr::filter(week == predict_week) %>% dplyr::select(game_id, week, home_team, away_team)
+  if (nrow(wk_games) == 0) return(tibble::tibble())
+  
+  # liga promedio para fallback
+  league_avg <- if (is.null(priors) || nrow(priors) == 0) {
+    setNames(as.list(rep(0, length(feature_cols))), feature_cols)
+  } else {
+    priors %>% dplyr::summarise(dplyr::across(dplyr::all_of(feature_cols), ~ mean(.x, na.rm = TRUE))) %>% as.list()
+  }
+  
+  wk_df <- wk_games %>%
+    dplyr::left_join(priors %>% dplyr::rename_with(~ paste0("home_", .x), dplyr::all_of(feature_cols)),
+                     by = c("home_team" = "team")) %>%
+    dplyr::left_join(priors %>% dplyr::rename_with(~ paste0("away_", .x), dplyr::all_of(feature_cols)),
+                     by = c("away_team" = "team"))
+  
+  for (fc in feature_cols) {
+    h <- paste0("home_", fc); a <- paste0("away_", fc)
+    if (!h %in% names(wk_df)) wk_df[[h]] <- NA_real_
+    if (!a %in% names(wk_df)) wk_df[[a]] <- NA_real_
+    wk_df[[h]] <- dplyr::coalesce(wk_df[[h]], as.numeric(league_avg[[fc]]))
+    wk_df[[a]] <- dplyr::coalesce(wk_df[[a]], as.numeric(league_avg[[fc]]))
+    wk_df[[paste0("diff_", fc)]] <- wk_df[[h]] - wk_df[[a]]
+  }
+  
+  x_mat <- as.matrix(wk_df %>% dplyr::select(dplyr::all_of(fit_obj$x_cols)))
+  dtest <- xgb.DMatrix(x_mat)
+  p <- predict(fit_obj$model, dtest)
+  
+  wk_df %>%
+    dplyr::transmute(
+      week, home_team, away_team,
+      prob_home_win = p,
+      prob_away_win = 1 - p,
+      predicted_winner = dplyr::if_else(prob_home_win >= 0.5, home_team, away_team)
+    )
+}
+
+# =========================================================
+# 1) Construir train para 2024 (W1–18) y 2025 (W1–2)
+# =========================================================
+f24 <- get_feats(2024)
+train_24 <- build_training_data(1:18, f24$team_game_feats, f24$sched, lambda)
+
+# Usa tus objetos 2025 ya construidos: team_game_feats y sched
+train_25 <- build_training_data(1:2, team_game_feats, sched, lambda)
+
+# Combinar y crear pesos (2024 = 1, 2025 = w_2025)
+train_24$season <- 2024
+train_25$season <- 2025
+train_all <- dplyr::bind_rows(train_24, train_25)
+
+row_w <- ifelse(train_all$season == 2025, w_2025, 1.0)
+
+# =========================================================
+# 2) Entrenar con pesos y predecir Semana 3 de 2025
+# =========================================================
+fit_obj <- fit_xgb_weighted(train_all, row_weights = row_w)
+
+preds_week3_2025 <- predict_week_diff(
+  predict_week = 3,
+  team_game_feats = team_game_feats,  # 2025 features ya calculadas por ti
+  sched = sched,                      # 2025 schedule ya cargado por ti
+  fit_obj = fit_obj,
+  lambda = lambda
+)
+
+# Orden bonito
+preds_week3_2025
+
+```
+
+
